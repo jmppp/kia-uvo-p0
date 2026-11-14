@@ -1,0 +1,1243 @@
+"""KiaUvoApiEU.py"""
+
+import base64
+import datetime as dt
+import json
+import logging
+import re
+import uuid
+from time import sleep
+from typing import Any, cast
+from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
+
+import requests
+from .auth_transport import (AuthSession, auth_request, TransientAuthError,
+    AuthProtocolError, AuthConfigurationError, auth_json, auth_token, auth_ttl, auth_value)
+from Crypto.Cipher import PKCS1_v1_5
+from Crypto.PublicKey import RSA
+
+from .ApiImpl import ApiImplSession
+from .ApiImplType1 import (
+    ApiImplType1,
+    _check_response_for_errors,
+    _retry_on_device_id_error,
+)
+from .cci_auth import CciAuthMixin
+from .cci_fingerprint import (
+    is_gate_rejection,
+)
+from .const import (
+    BRAND_GENESIS,
+    BRAND_HYUNDAI,
+    BRAND_KIA,
+    BRANDS,
+    CHARGE_PORT_ACTION,
+    DISTANCE_UNITS,
+    DOMAIN,
+    ENGINE_TYPES,
+    SEAT_STATUS,
+    TEMPERATURE_UNITS,
+)
+from .exceptions import (
+    APIError,
+    AuthenticationBlockedError,
+    AuthenticationCertificateError,
+    AuthenticationError,
+    AuthenticationInvalidCredentialsError,
+    AuthenticationRedirectError,
+    AuthenticationSigninError,
+    ConsentRequiredError,
+    DeviceIDError,
+)
+from .Token import Token
+from .utils import (
+    get_child_value,
+    get_hex_temp_into_index,
+    normalize_battery_soc,
+    normalize_battery_soh,
+    parse_datetime,
+)
+from .Vehicle import (
+    Vehicle,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+USER_AGENT_MOZILLA: str = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+
+SUPPORTED_LANGUAGES_LIST = [
+    "en",  # English
+    "de",  # German
+    "fr",  # French
+    "it",  # Italian
+    "es",  # Spanish
+    "sv",  # Swedish
+    "nl",  # Dutch
+    "no",  # Norwegian
+    "cs",  # Czech
+    "sk",  # Slovak
+    "hu",  # Hungarian
+    "da",  # Danish
+    "pl",  # Polish
+    "fi",  # Finnish
+    "pt",  # Portuguese
+]
+
+
+class KiaUvoApiEU(CciAuthMixin, ApiImplType1):
+    data_timezone = ZoneInfo("Europe/Berlin")
+    temperature_range = tuple(x * 0.5 for x in range(28, 64))
+
+    def __init__(self, region: int, brand: int, language: str) -> None:
+        language = language.lower()
+        # Strip language variants (e.g. en-Gb)
+        if len(language) > 2:
+            language = language[0:2]
+        if language not in SUPPORTED_LANGUAGES_LIST:
+            _LOGGER.warning(f"Unsupported language: {language}, fallback to en")
+            language = "en"  # fallback to English
+        self.LANGUAGE: str = language
+        self.brand: int = brand
+
+        if BRANDS[self.brand] == BRAND_KIA:
+            self.BASE_DOMAIN: str = "prd.eu-ccapi.kia.com"
+            self.PORT: int = 8080
+            self.CCSP_SERVICE_ID: str = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
+            self.APP_ID: str = "a2b8469b-30a3-4361-8e13-6fceea8fbe74"
+            self.CFB = base64.b64decode(
+                "wLTVxwidmH8CfJYBWSnHD6E0huk0ozdiuygB4hLkM5XCgzAL1Dk5sE36d/bx5PFMbZs="
+            )
+            self.LOGIN_FORM_HOST = "https://idpconnect-eu.kia.com"
+            self.PUSH_TYPE = "APNS"
+        elif BRANDS[self.brand] == BRAND_HYUNDAI:
+            self.BASE_DOMAIN = "prd.eu-ccapi.hyundai.com"
+            self.PORT = 8080
+            self.CCSP_SERVICE_ID = "6d477c38-3ca4-4cf3-9557-2a1929a94654"
+            self.APP_ID = "014d2225-8495-4735-812d-2616334fd15d"
+            self.CFB = base64.b64decode(
+                "RFtoRq/vDXJmRndoZaZQyfOot7OrIqGVFj96iY2WL3yyH5Z/pUvlUhqmCxD2t+D65SQ="
+            )
+            self.LOGIN_FORM_HOST = "https://idpconnect-eu.hyundai.com"
+            self.PUSH_TYPE = "GCM"
+        elif BRANDS[self.brand] == BRAND_GENESIS:
+            self.BASE_DOMAIN = "prd-eu-ccapi.genesis.com"
+            self.PORT = 443
+            self.CCSP_SERVICE_ID = "3020afa2-30ff-412a-aa51-d28fbe901e10"
+            self.APP_ID = "f11f2b86-e0e7-4851-90df-5600b01d8b70"
+            self.CFB = base64.b64decode(
+                "RFtoRq/vDXJmRndoZaZQyYo3/qFLtVReW8P7utRPcc0ZxOzOELm9mexvviBk/qqIp4A="
+            )
+            self.LOGIN_FORM_HOST = "https://idpconnect-eu.genesis.com"
+            self.PUSH_TYPE = "GCM"
+
+        self.BASE_URL: str = self.BASE_DOMAIN + ":" + str(self.PORT)
+        self.USER_API_URL: str = "https://" + self.BASE_URL + "/api/v1/user/"
+        self.SPA_API_URL: str = "https://" + self.BASE_URL + "/api/v1/spa/"
+        self.SPA_API_URL_V2: str = "https://" + self.BASE_URL + "/api/v2/spa/"
+
+        self.CLIENT_ID: str = self.CCSP_SERVICE_ID
+        self.GCM_SENDER_ID = 199360397125
+
+        # Brand-specific OAuth2 redirect URI for the IDPConnect flow.
+        if BRANDS[self.brand] == BRAND_KIA:
+            self._oauth_redirect_uri: str = self.USER_API_URL + "oauth2/redirect"
+        elif BRANDS[self.brand] == BRAND_HYUNDAI:
+            self._oauth_redirect_uri = self.USER_API_URL + "oauth2/token"
+        elif BRANDS[self.brand] == BRAND_GENESIS:
+            self._oauth_redirect_uri = (
+                "https://accounts-eu.genesis.com/realms/eugenesisidm/ga-api/redirect2"
+            )
+
+        # OneApp/CCI login flow (EU Hyundai/Kia/Genesis) — bypasses the IDPConnect
+        # WAF that blocks the legacy authorize by client_id (#1273). All three EU
+        # brands are blocked (Genesis PORT=443 is not spared — the WAF blocks by
+        # client_id, not port), so all three use the CCI flow.
+        if BRANDS[self.brand] == BRAND_HYUNDAI:
+            self.ONEAPP_CLIENT_ID: str = "4f4953b5-02e1-4dbc-8599-87e983ee1be5"
+            self.ONEAPP_REDIRECT_URI: str = "https://oneapp.hyundai.com/redirect"
+            self.CCI_API_URL: str = "https://cci-api-eu.hyundai.com"
+            self.CCI_PACKAGE_ID: str = "com.hyundai.oneapp.eu"
+            self._cci_client_name: str = "hyundai"
+        elif BRANDS[self.brand] == BRAND_KIA:
+            self.ONEAPP_CLIENT_ID = "01b36c86-79e8-486c-8009-15f2ad88d670"
+            self.ONEAPP_REDIRECT_URI = "https://oneapp.kia.com/redirect"
+            self.CCI_API_URL = "https://cci-api-eu.kia.com"
+            self.CCI_PACKAGE_ID = "com.kia.oneapp.eu"
+            self._cci_client_name = "kia"
+        else:  # BRAND_GENESIS
+            self.ONEAPP_CLIENT_ID = "50e3b8b0-ced5-43b7-8a42-f86ac92fe50e"
+            self.ONEAPP_REDIRECT_URI = "https://oneapp.genesis.com/redirect"
+            self.CCI_API_URL = "https://cci-api-eu.genesis.com"
+            self.CCI_PACKAGE_ID = "com.genesis.oneapp.eu"
+            self._cci_client_name = "genesis"
+        self._cci_client_version: str = "1.3.3"
+        self._cci_client_os_version: str = (
+            "27" if BRANDS[self.brand] == BRAND_KIA else "18.7"
+        )
+        self._cci_notification_provider: str = (
+            "IOS_APPSTORE" if BRANDS[self.brand] == BRAND_KIA else "APNS"
+        )
+
+        self.session = ApiImplSession()
+
+    _strict_auth_protocol = True
+
+    def login(
+        self,
+        username: str,
+        password: str,
+        pin: str | None = None,
+    ) -> Token:
+        stamp = self._get_stamp()
+        try:
+            with AuthSession() as session:
+                device_id = self._get_device_id(stamp, session=session)
+        except (TransientAuthError, AuthConfigurationError):
+            raise
+        except (ValueError, KeyError, TypeError):
+            raise AuthProtocolError() from None
+        except (AuthenticationError, DeviceIDError, APIError) as ex:
+            # The legacy register endpoint is the first thing login(), and
+            # therefore every full-login recovery, depends on. When it is
+            # down or rejects the request, the CCI login itself is fine —
+            # fall back to a random device identity (the GspaApiEU login
+            # path always used one) instead of failing the whole login.
+            _LOGGER.warning(
+                "Legacy device registration rejected; using a random device identity"
+            )
+            device_id = str(uuid.uuid4())
+        cookies = self._get_cookies()
+        self._set_session_language(cookies)
+
+        info = self._login_with_password(username, password, device_id)
+        # _login_with_password is the CCI flow; it always returns valid_until.
+        valid_until = info["valid_until"]
+
+        return Token(
+            username=username,
+            password=password,
+            access_token=info["access_token"],
+            refresh_token=info["refresh_token"],
+            device_id=device_id,
+            valid_until=valid_until,
+            pin=pin,
+            cci_access_token=info.get("cci_access_token"),
+            exchangeable_token=info.get("exchangeable_token"),
+            exchangeable_refresh_token=info.get("exchangeable_refresh_token"),
+            non_ccs_token=info.get("non_ccs_token"),
+            non_ccs_refresh_token=info.get("non_ccs_refresh_token"),
+            id_token=info.get("id_token"),
+        )
+
+    def _login_with_password(
+        self, username: str, password: str, device_id: str
+    ) -> dict[str, Any]:
+        """Headless login using username + plaintext password (OneApp/CCI flow).
+
+        All EU brands (Hyundai/Kia/Genesis) use the OneApp/CCI flow, which
+        bypasses the IDPConnect WAF that blocks the legacy authorize by client_id
+        (#1273). Returns a dict with access_token, refresh_token, expires_in and
+        the CCI token fields needed for refresh.
+
+        Raises:
+            AuthenticationError: If login fails.
+        """
+        return self._login_with_password_cci(username, password, device_id)
+
+    def _login_with_password_cci(
+        self, username: str, password: str, device_id: str
+    ) -> dict[str, Any]:
+        """OneApp/CCI password login (EU Hyundai/Kia) — bypasses the IDPConnect WAF.
+
+        Uses the OneApp client_id (4f4953b5 / 01b36c86) whose authorize is not
+        WAF-blocked, then exchanges the resulting CCI token for a CCS token that
+        the legacy ccapi:8080 vehicle endpoints accept. See #1273.
+        """
+        host = self.LOGIN_FORM_HOST
+        client_id = self.ONEAPP_CLIENT_ID
+        redirect_uri = self.ONEAPP_REDIRECT_URI
+        mobile_ua = USER_AGENT_MOZILLA + "_CCS_APP_AOS"
+
+        with AuthSession() as s:
+            s.headers.update({"User-Agent": mobile_ua})
+
+            # Step 1: authorize (passes WAF — OneApp client_id is not on the block list)
+            auth_url = (
+                f"{host}/auth/api/v2/user/oauth2/authorize"
+                f"?response_type=code&client_id={client_id}"
+                f"&redirect_uri={redirect_uri}&lang=en&state=ccsp&country=de"
+            )
+            auth_resp = s.get(auth_url, allow_redirects=True)
+            if "abusing" in auth_resp.text.lower() or "/error?status=400" in auth_resp.url:
+                raise AuthProtocolError()
+
+            # Step 2: RSA public key
+            resp = s.get(f"{host}/auth/api/v1/accounts/certs")
+            if resp.status_code != 200:
+                raise AuthProtocolError(status=resp.status_code)
+            try:
+                jwk = auth_json(resp).get("retValue", {})
+                kid = jwk.get("kid", "")
+                n_bytes = base64.urlsafe_b64decode(auth_token(jwk, "n") + "==")
+                e_bytes = base64.urlsafe_b64decode(auth_token(jwk, "e") + "==")
+                key = RSA.construct((int.from_bytes(n_bytes, "big"), int.from_bytes(e_bytes, "big")))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise AuthProtocolError() from None
+            encrypted_pw = PKCS1_v1_5.new(key).encrypt(password.encode("utf-8")).hex()
+
+            # Step 3: signin with RSA-encrypted password (state=ccsp, FULL email)
+            resp = s.post(
+                f"{host}/auth/account/signin",
+                data={
+                    "client_id": client_id,
+                    "encryptedPassword": "true",
+                    "password": encrypted_pw,
+                    "redirect_uri": redirect_uri,
+                    "scope": "",
+                    "nonce": "",
+                    "state": "ccsp",
+                    "username": username,
+                    "connector_session_key": "",
+                    "kid": kid,
+                    "_csrf": "",
+                },
+                allow_redirects=False,
+            )
+            if resp.status_code != 302:
+                raise AuthProtocolError(status=resp.status_code)
+            location = resp.headers.get("location", "")
+            code_list = parse_qs(urlparse(location).query).get("code")
+            if not code_list:
+                query = parse_qs(urlparse(location).query)
+
+                if query.get("error"):
+                    error_desc = query.get("error_description", ["unknown"])[0]
+                    if error_desc.strip().casefold() == "invalid credentials":
+                        raise AuthenticationInvalidCredentialsError(
+                            "Authentication rejected: invalid credentials."
+                        )
+                    raise AuthProtocolError()
+                if "/web/v1/user/authorization" in location:
+                    raise ConsentRequiredError(
+                        "Account consent is required. Please log in via a browser "
+                        "once to accept the terms, then retry."
+                    )
+                if "authorize" in location:
+                    raise AuthProtocolError()
+                raise AuthProtocolError()
+            code = code_list[0]
+
+            # Step 4: exchange auth code for CCI tokens (code in URL query, no body)
+            cci = self._exchange_auth_code_for_cci_tokens(device_id, code)
+            cci_access_token = cci.get("accessToken", "")
+            cci_refresh_token = auth_value(cci, "refreshToken", header=True)
+            non_ccs_token = auth_value(cci, "nonCcsToken", header=True)
+            exchangeable_token = auth_value(cci, "exchangeableAccessToken", header=True)
+            exchangeable_refresh_token = auth_value(cci, "exchangeableRefreshToken", header=True)
+            non_ccs_refresh_token = auth_value(cci, "nonCcsRefreshToken", header=True)
+            id_token = auth_value(cci, "idToken", header=True)
+            cci_expires_in = auth_ttl(cci.get("expiresIn"), 3599)
+
+            # Step 5: exchange CCI token for a CCS token (usable on legacy ccapi:8080)
+            ccs_token, ccs_valid_until = self._exchange_ccs_token(
+                device_id, cci_access_token, non_ccs_token, exchangeable_token
+            )
+
+            return {
+                "access_token": "Bearer " + ccs_token,
+                "refresh_token": cci_refresh_token,
+                "expires_in": cci_expires_in,
+                "valid_until": ccs_valid_until,
+                "cci_access_token": cci_access_token,
+                "exchangeable_token": exchangeable_token,
+                "exchangeable_refresh_token": exchangeable_refresh_token,
+                "non_ccs_token": non_ccs_token,
+                "non_ccs_refresh_token": non_ccs_refresh_token,
+                "id_token": id_token,
+            }
+
+    def refresh_access_token(self, token: Token) -> Token:
+        """Refresh access token using the stored CCI token set.
+
+        POST /auth/v2/token-refresh with the full token set, then re-exchange
+        the CCS token. Falls back to full login if the refresh fails.
+        """
+        if getattr(token, "cci_access_token", None) or getattr(
+            token, "non_ccs_token", None
+        ):
+            try:
+                return self._refresh_cci_token(token)
+            except (TransientAuthError, AuthConfigurationError):
+                raise
+            except AuthenticationError:
+                _LOGGER.warning("Kia refresh authorization rejected; one credential login follows")
+            except Exception:
+                raise AuthProtocolError() from None
+        return self.login(token.username, token.password, token.pin)
+
+    def _refresh_cci_token(self, token: Token) -> Token:
+        """Refresh the CCI token set and re-exchange the CCS token.
+
+        POST /auth/v2/token-refresh with the full CCI token set, signed with
+        X-Fingerprint over the exact body bytes (the refresh is on the same
+        fingerprint gate as the exchange, live 2026-10-14); the legacy
+        domain/api route runs as fallback. Returns a new Token with updated
+        CCI + CCS fields.
+        """
+        device_id = token.device_id or ""
+        body = {
+            "accessToken": (token.cci_access_token or "").removeprefix("Bearer "),
+            "refreshToken": token.refresh_token or "",
+            "exchangeableAccessToken": token.exchangeable_token or "",
+            "exchangeableRefreshToken": token.exchangeable_refresh_token or "",
+            "nonCcsToken": token.non_ccs_token or "",
+            "nonCcsRefreshToken": token.non_ccs_refresh_token or "",
+            "idToken": token.id_token or "",
+        }
+        body = {key: auth_value(body, key, header=True) for key in body}
+        payload = json.dumps(body)
+        headers = self._cci_fp_headers(device_id, body=payload)
+        headers["Content-Type"] = "application/json"
+        resp = auth_request("post",
+            f"{self.CCI_API_URL}/auth/v2/token-refresh",
+            data=payload,
+            headers=headers,
+            timeout=(5, 30),
+        )
+        if resp.status_code != 200 and is_gate_rejection(resp.status_code, resp.text):
+            _LOGGER.error(
+                f"{DOMAIN} - Fingerprint gate rejected the signed token "
+                f"refresh (HTTP {resp.status_code}); fell back to the legacy "
+                "route. This fallback is transitional - report this log so "
+                "the fallback can be removed"
+            )
+            headers = self._get_cci_headers(
+                device_id,
+                cci_access_token=token.cci_access_token,
+                non_ccs_token=token.non_ccs_token,
+                exchangeable_token=token.exchangeable_token,
+                content_type="application/json",
+            )
+            resp = auth_request("post",
+                f"{self.CCI_DOMAIN_API_URL}v2/auth/token-refresh",
+                headers=headers,
+                json=body,
+                timeout=(5, 30),
+            )
+        if resp.status_code != 200:
+            if resp.status_code == 401:
+                raise AuthenticationError("Kia refresh authorization rejected")
+            raise AuthProtocolError(status=resp.status_code)
+        data = auth_json(resp)
+        cci_access_token = auth_token(data, "accessToken")
+        cci_refresh_token = auth_value(data, "refreshToken", token.refresh_token or "", header=True)
+        non_ccs_token = auth_value(data, "nonCcsToken", token.non_ccs_token or "", header=True)
+        exchangeable_token = auth_value(data, "exchangeableAccessToken", token.exchangeable_token or "", header=True)
+        exchangeable_refresh_token = auth_value(data, "exchangeableRefreshToken", token.exchangeable_refresh_token or "", header=True)
+        non_ccs_refresh_token = auth_value(data, "nonCcsRefreshToken", token.non_ccs_refresh_token or "", header=True)
+        id_token = auth_value(data, "idToken", token.id_token or "", header=True)
+
+        # set-cookie t= may carry an updated exchangeable token
+        set_cookie = resp.headers.get("set-cookie", "")
+        if "t=" in set_cookie:
+            m = re.search(r"t=([^;]+)", set_cookie)
+            if m and m.group(1):
+                exchangeable_token = auth_value({"cookie": m.group(1)}, "cookie", header=True)
+
+        # Re-exchange the CCS token (accepted by legacy ccapi:8080)
+        ccs_token, ccs_valid_until = self._exchange_ccs_token(
+            device_id, cci_access_token, non_ccs_token, exchangeable_token
+        )
+
+        return Token(
+            username=token.username,
+            password=token.password,
+            access_token="Bearer " + ccs_token,
+            refresh_token=cci_refresh_token,
+            device_id=token.device_id,
+            valid_until=ccs_valid_until,
+            pin=token.pin,
+            cci_access_token=cci_access_token,
+            exchangeable_token=exchangeable_token,
+            exchangeable_refresh_token=exchangeable_refresh_token,
+            non_ccs_token=non_ccs_token,
+            non_ccs_refresh_token=non_ccs_refresh_token,
+            id_token=id_token,
+        )
+
+    @_retry_on_device_id_error
+    def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id
+        is_ccs2 = vehicle.ccu_ccs2_protocol_support != 0
+        _LOGGER.debug(
+            f"{DOMAIN} - CCU CCS Support: {vehicle.ccu_ccs2_protocol_support}"
+        )
+
+        if is_ccs2:
+            url += "/ccs2/carstatus/latest"
+        else:
+            url += "/status/latest"
+
+        response = self.session.get(
+            url,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        ).json()
+
+        _LOGGER.debug(f"{DOMAIN} - get_cached_vehicle_status response: {response}")
+        _check_response_for_errors(response)
+
+        if vehicle.ccu_ccs2_protocol_support == 0:
+            self._update_vehicle_properties(
+                vehicle, response["resMsg"]["vehicleStatusInfo"]
+            )
+        else:
+            state = response["resMsg"]["state"]["Vehicle"]
+            self._update_vehicle_properties_ccs2(vehicle, state)
+
+        # The status response embeds a stale cached location.
+        # Override it with the more current /location/park endpoint.
+        # this is not a force endpoint so car will not wake up
+        self._set_cached_location_park(token, vehicle)
+
+        if (
+            vehicle.engine_type == ENGINE_TYPES.EV
+            or vehicle.engine_type == ENGINE_TYPES.PHEV
+        ):
+            try:
+                state = self._get_driving_info(token, vehicle)
+            except Exception as e:
+                # we don't know if all car types (ex: ICE cars) provide this
+                # information. We also don't know what the API returns if
+                # the info is unavailable. So, catch any exception and move on.
+                _LOGGER.exception(
+                    """Failed to parse driving info. Possible reasons:
+                                    - incompatible vehicle (ICE)
+                                    - new API format
+                                    - API outage
+                            """,
+                    exc_info=e,
+                )
+            else:
+                self._update_vehicle_drive_info(vehicle, state)
+
+    @_retry_on_device_id_error
+    def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
+        is_ccs2 = vehicle.ccu_ccs2_protocol_support != 0
+        if is_ccs2:
+            self._force_refresh_vehicle_state_ccs2(token, vehicle)
+        else:
+            state = self._get_forced_vehicle_state(token, vehicle)
+            location = self._get_location(token, vehicle)
+            state["vehicleLocation"] = location
+            self._update_vehicle_properties(vehicle, state)
+            # Must run after _update_vehicle_properties: that method labels
+            # vehicleLocation.time with data_timezone, which is correct for the
+            # cached feed but wrong for the GET /location payload attached above.
+            self._set_location_from_gps_detail(vehicle, location)
+        # Only call for driving info on cars we know have a chance of supporting it.
+        # Could be expanded if other types do support it.
+        if (
+            vehicle.engine_type == ENGINE_TYPES.EV
+            or vehicle.engine_type == ENGINE_TYPES.PHEV
+        ):
+            try:
+                drive_info = self._get_driving_info(token, vehicle)
+            except Exception as e:
+                # we don't know if all car types provide this information.
+                # we also don't know what the API returns if the info is unavailable.
+                # so, catch any exception and move on.
+                _LOGGER.exception(
+                    """Failed to parse driving info. Possible reasons:
+                                    - new API format
+                                    - API outage
+                            """,
+                    exc_info=e,
+                )
+            else:
+                self._update_vehicle_drive_info(vehicle, drive_info)
+
+    def _force_refresh_vehicle_state_ccs2(self, token: Token, vehicle: Vehicle) -> None:
+        """Force-refresh CCS2 state: wake the vehicle, wait, read the cached snapshot.
+
+        GET /ccs2/carstatus (no /latest) wakes the vehicle but returns an async
+        command envelope ({retCode, resCode, msgId}), not state — reading
+        resMsg.state.Vehicle from it raised KeyError: 'resMsg' (kia_uvo #1786,
+        #1806). Instead: wake, sleep for the car to report (~20s live-measured on
+        a reachable EU CCS2 car), then read the now-fresh cached /latest snapshot.
+
+        The wake GET must return valid JSON; its body is discarded but errors
+        propagate, so a failed wake does not fall through to a stale /latest apply.
+        """
+        headers = self._get_authenticated_headers(
+            token, vehicle.ccu_ccs2_protocol_support
+        )
+        trigger_url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/ccs2/carstatus"
+        self.session.get(trigger_url, headers=headers).json()
+        sleep(25)
+        latest_url = trigger_url + "/latest"
+        response = self.session.get(latest_url, headers=headers).json()
+        _LOGGER.debug(
+            f"{DOMAIN} - Force refresh CCS2 vehicle status response: {response}"
+        )
+        _check_response_for_errors(response)
+        state = response["resMsg"]["state"]["Vehicle"]
+        self._update_vehicle_properties_ccs2(vehicle, state)
+        self._set_cached_location_park(token, vehicle)
+
+    def _update_vehicle_properties(
+        self, vehicle: Vehicle, state: dict[str, Any]
+    ) -> None:
+        if get_child_value(state, "vehicleStatus.time"):
+            vehicle.last_updated_at = parse_datetime(
+                get_child_value(state, "vehicleStatus.time"), self.data_timezone
+            )
+        else:
+            vehicle.last_updated_at = dt.datetime.now(self.data_timezone)
+        if get_child_value(state, "odometer.value"):
+            vehicle.odometer = (
+                get_child_value(state, "odometer.value"),
+                DISTANCE_UNITS[
+                    get_child_value(
+                        state,
+                        "odometer.unit",
+                    )
+                ],
+            )
+        vehicle.car_battery_percentage = normalize_battery_soc(
+            get_child_value(state, "vehicleStatus.battery.batSoc")
+        )
+        vehicle.engine_is_running = get_child_value(state, "vehicleStatus.engine")
+
+        # Converts temp to usable number. Currently only support celsius.
+        # Future to do is check unit in case the care itself is set to F.
+        if get_child_value(state, "vehicleStatus.airTemp.value"):
+            tempIndex = cast(
+                int,
+                get_hex_temp_into_index(
+                    get_child_value(state, "vehicleStatus.airTemp.value")
+                ),
+            )
+
+            vehicle.air_temperature = (
+                self.temperature_range[tempIndex],
+                TEMPERATURE_UNITS[
+                    get_child_value(
+                        state,
+                        "vehicleStatus.airTemp.unit",
+                    )
+                ],
+            )
+        vehicle.defrost_is_on = get_child_value(state, "vehicleStatus.defrost")
+        steer_wheel_heat = get_child_value(state, "vehicleStatus.steerWheelHeat")
+        if steer_wheel_heat in [0, 2]:
+            vehicle.steering_wheel_heater_is_on = False
+        elif steer_wheel_heat == 1:
+            vehicle.steering_wheel_heater_is_on = True
+
+        vehicle.back_window_heater_is_on = get_child_value(
+            state, "vehicleStatus.sideBackWindowHeat"
+        )
+        vehicle.side_mirror_heater_is_on = get_child_value(
+            state, "vehicleStatus.sideMirrorHeat"
+        )
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
+            get_child_value(state, "vehicleStatus.seatHeaterVentState.flSeatHeatState")
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
+            get_child_value(state, "vehicleStatus.seatHeaterVentState.frSeatHeatState")
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
+            get_child_value(state, "vehicleStatus.seatHeaterVentState.rlSeatHeatState")
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
+            get_child_value(state, "vehicleStatus.seatHeaterVentState.rrSeatHeatState")
+        )
+        # lamp wire status (nested)
+        vehicle.headlamp_status = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.headLampStatus"
+        )
+        vehicle.headlamp_left_low = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.leftLowLamp"
+        )
+        vehicle.headlamp_right_low = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.rightLowLamp"
+        )
+        vehicle.headlamp_left_high = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.leftHighLamp"
+        )
+        vehicle.headlamp_right_high = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.rightHighLamp"
+        )
+        vehicle.headlamp_left_bifunc = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.leftBifuncLamp"
+        )
+        vehicle.headlamp_right_bifunc = get_child_value(
+            state, "vehicleStatus.lampWireStatus.headLamp.rightBifuncLamp"
+        )
+        vehicle.stop_lamp_left = get_child_value(
+            state, "vehicleStatus.lampWireStatus.stopLamp.leftLamp"
+        )
+        vehicle.stop_lamp_right = get_child_value(
+            state, "vehicleStatus.lampWireStatus.stopLamp.rightLamp"
+        )
+        vehicle.turn_signal_left_front = get_child_value(
+            state, "vehicleStatus.lampWireStatus.turnSignalLamp.leftFrontLamp"
+        )
+        vehicle.turn_signal_right_front = get_child_value(
+            state, "vehicleStatus.lampWireStatus.turnSignalLamp.rightFrontLamp"
+        )
+        vehicle.turn_signal_left_rear = get_child_value(
+            state, "vehicleStatus.lampWireStatus.turnSignalLamp.leftRearLamp"
+        )
+        vehicle.turn_signal_right_rear = get_child_value(
+            state, "vehicleStatus.lampWireStatus.turnSignalLamp.rightRearLamp"
+        )
+        vehicle.is_locked = get_child_value(state, "vehicleStatus.doorLock")
+        vehicle.front_left_door_is_open = get_child_value(
+            state, "vehicleStatus.doorOpen.frontLeft"
+        )
+        vehicle.front_right_door_is_open = get_child_value(
+            state, "vehicleStatus.doorOpen.frontRight"
+        )
+        vehicle.back_left_door_is_open = get_child_value(
+            state, "vehicleStatus.doorOpen.backLeft"
+        )
+        vehicle.back_right_door_is_open = get_child_value(
+            state, "vehicleStatus.doorOpen.backRight"
+        )
+        vehicle.hood_is_open = get_child_value(state, "vehicleStatus.hoodOpen")
+        vehicle.front_left_window_is_open = get_child_value(
+            state, "vehicleStatus.windowOpen.frontLeft"
+        )
+        vehicle.front_right_window_is_open = get_child_value(
+            state, "vehicleStatus.windowOpen.frontRight"
+        )
+        vehicle.back_left_window_is_open = get_child_value(
+            state, "vehicleStatus.windowOpen.backLeft"
+        )
+        vehicle.back_right_window_is_open = get_child_value(
+            state, "vehicleStatus.windowOpen.backRight"
+        )
+        vehicle.tire_pressure_rear_left_warning_is_on = bool(
+            get_child_value(state, "vehicleStatus.tirePressureLamp.tirePressureLampRL")
+        )
+        vehicle.tire_pressure_front_left_warning_is_on = bool(
+            get_child_value(state, "vehicleStatus.tirePressureLamp.tirePressureLampFL")
+        )
+        vehicle.tire_pressure_front_right_warning_is_on = bool(
+            get_child_value(state, "vehicleStatus.tirePressureLamp.tirePressureLampFR")
+        )
+        vehicle.tire_pressure_rear_right_warning_is_on = bool(
+            get_child_value(state, "vehicleStatus.tirePressureLamp.tirePressureLampRR")
+        )
+        vehicle.tire_pressure_all_warning_is_on = bool(
+            get_child_value(state, "vehicleStatus.tirePressureLamp.tirePressureLampAll")
+        )
+        vehicle.trunk_is_open = get_child_value(state, "vehicleStatus.trunkOpen")
+        vehicle.ev_battery_percentage = get_child_value(
+            state, "vehicleStatus.evStatus.batteryStatus"
+        )
+        if battery_soh := normalize_battery_soh(
+            get_child_value(state, "vehicleStatus.evStatus.batterySoh")
+        ):
+            vehicle.ev_battery_soh_percentage = battery_soh
+        vehicle.ev_battery_is_charging = get_child_value(
+            state, "vehicleStatus.evStatus.batteryCharge"
+        )
+
+        vehicle.ev_battery_is_plugged_in = get_child_value(
+            state, "vehicleStatus.evStatus.batteryPlugin"
+        )
+
+        ev_charge_port_door_is_open = get_child_value(
+            state, "vehicleStatus.evStatus.chargePortDoorOpenStatus"
+        )
+
+        if ev_charge_port_door_is_open == 1:
+            vehicle.ev_charge_port_door_is_open = True
+        elif ev_charge_port_door_is_open == 2:
+            vehicle.ev_charge_port_door_is_open = False
+
+        if (
+            get_child_value(
+                state, "vehicleStatus.evStatus.batteryPower.batteryStndChrgPower"
+            )
+            is not None
+        ):
+            vehicle.ev_charging_power = get_child_value(
+                state, "vehicleStatus.evStatus.batteryPower.batteryStndChrgPower"
+            )
+
+        if (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.value",
+            )
+            is not None
+        ):
+            vehicle.total_driving_range = (
+                round(
+                    float(
+                        get_child_value(
+                            state,
+                            "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.value",
+                        )
+                    ),
+                    1,
+                ),
+                DISTANCE_UNITS[
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.unit",
+                    )
+                ],
+            )
+        if (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.evModeRange.value",
+            )
+            is not None
+        ):
+            vehicle.ev_driving_range = (
+                round(
+                    float(
+                        get_child_value(
+                            state,
+                            "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.evModeRange.value",
+                        )
+                    ),
+                    1,
+                ),
+                DISTANCE_UNITS[
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.evModeRange.unit",
+                    )
+                ],
+            )
+        vehicle.ev_estimated_current_charge_duration = (
+            get_child_value(state, "vehicleStatus.evStatus.remainTime2.atc.value"),
+            "m",
+        )
+        vehicle.ev_estimated_fast_charge_duration = (
+            get_child_value(state, "vehicleStatus.evStatus.remainTime2.etc1.value"),
+            "m",
+        )
+        vehicle.ev_estimated_portable_charge_duration = (
+            get_child_value(state, "vehicleStatus.evStatus.remainTime2.etc2.value"),
+            "m",
+        )
+        vehicle.ev_estimated_station_charge_duration = (
+            get_child_value(state, "vehicleStatus.evStatus.remainTime2.etc3.value"),
+            "m",
+        )
+
+        target_soc_list = get_child_value(
+            state, "vehicleStatus.evStatus.reservChargeInfos.targetSOClist"
+        )
+        try:
+            vehicle.ev_charge_limits_ac = [
+                x["targetSOClevel"] for x in target_soc_list if x["plugType"] == 1
+            ][-1]
+            vehicle.ev_charge_limits_dc = [
+                x["targetSOClevel"] for x in target_soc_list if x["plugType"] == 0
+            ][-1]
+        except Exception:
+            _LOGGER.debug(f"{DOMAIN} - SOC Levels couldn't be found. May not be an EV.")
+        if (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.value",
+            )
+            is not None
+        ):
+            vehicle.fuel_driving_range = (
+                get_child_value(
+                    state,
+                    "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.value",
+                ),
+                DISTANCE_UNITS[
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.unit",
+                    )
+                ],
+            )
+        elif get_child_value(
+            state,
+            "vehicleStatus.dte.value",
+        ):
+            vehicle.fuel_driving_range = (
+                get_child_value(
+                    state,
+                    "vehicleStatus.dte.value",
+                ),
+                DISTANCE_UNITS[get_child_value(state, "vehicleStatus.dte.unit")],
+            )
+
+        vehicle.ev_target_range_charge_AC = (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.targetSOClist.1.dte.rangeByFuel.totalAvailableRange.value",
+            ),
+            DISTANCE_UNITS[
+                get_child_value(
+                    state,
+                    "vehicleStatus.evStatus.reservChargeInfos.targetSOClist.1.dte.rangeByFuel.totalAvailableRange.unit",
+                )
+            ],
+        )
+        vehicle.ev_target_range_charge_DC = (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.targetSOClist.0.dte.rangeByFuel.totalAvailableRange.value",
+            ),
+            DISTANCE_UNITS[
+                get_child_value(
+                    state,
+                    "vehicleStatus.evStatus.reservChargeInfos.targetSOClist.0.dte.rangeByFuel.totalAvailableRange.unit",
+                )
+            ],
+        )
+        vehicle.ev_first_departure_enabled = get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservChargeSet",
+        )
+        vehicle.ev_second_departure_enabled = get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservChargeSet",
+        )
+        vehicle.ev_first_departure_days = get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservInfo.day",
+        )
+        vehicle.ev_second_departure_days = get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservInfo.day",
+        )
+
+        vehicle.ev_first_departure_time = self._get_time_from_string(
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservInfo.time.time",
+            ),
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservInfo.time.timeSection",
+            ),
+        )
+
+        vehicle.ev_second_departure_time = self._get_time_from_string(
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservInfo.time.time",
+            ),
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservInfo.time.timeSection",
+            ),
+        )
+
+        vehicle.ev_first_departure_climate_enabled = bool(
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservFatcSet.airCtrl",
+            )
+        )
+
+        vehicle.ev_second_departure_climate_enabled = bool(
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservFatcSet.airCtrl",
+            )
+        )
+
+        if get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservFatcSet.airTemp.value",
+        ):
+            temp_index = cast(
+                int,
+                get_hex_temp_into_index(
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservFatcSet.airTemp.value",
+                    )
+                ),
+            )
+
+            vehicle.ev_first_departure_climate_temperature = (
+                self.temperature_range[temp_index],
+                TEMPERATURE_UNITS[
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservFatcSet.airTemp.unit",
+                    )
+                ],
+            )
+
+        if get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservFatcSet.airTemp.value",
+        ):
+            temp_index = cast(
+                int,
+                get_hex_temp_into_index(
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservFatcSet.airTemp.value",
+                    )
+                ),
+            )
+
+            vehicle.ev_second_departure_climate_temperature = (
+                self.temperature_range[temp_index],
+                TEMPERATURE_UNITS[
+                    get_child_value(
+                        state,
+                        "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservFatcSet.airTemp.unit",
+                    )
+                ],
+            )
+
+        vehicle.ev_first_departure_climate_defrost = get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reservChargeInfo.reservChargeInfoDetail.reservFatcSet.defrost",
+        )
+
+        vehicle.ev_second_departure_climate_defrost = get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.reserveChargeInfo2.reservChargeInfoDetail.reservFatcSet.defrost",
+        )
+
+        vehicle.ev_off_peak_start_time = self._get_time_from_string(
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerTime1.starttime.time",
+            ),
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerTime1.starttime.timeSection",
+            ),
+        )
+
+        vehicle.ev_off_peak_end_time = self._get_time_from_string(
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerTime1.endtime.time",
+            ),
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerTime1.endtime.timeSection",
+            ),
+        )
+
+        # offPeakPowerFlag semantics match the apps' vehicle data model:
+        # 1 = considering peak time ("off-peak tariffs prioritised"),
+        # 2 = only peak time ("off-peak tariffs only"), 0 = not applied.
+        if get_child_value(
+            state,
+            "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerFlag",
+        ):
+            if (
+                get_child_value(
+                    state,
+                    "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerFlag",
+                )
+                == 2
+            ):
+                vehicle.ev_off_peak_charge_only_enabled = True
+            elif (
+                get_child_value(
+                    state,
+                    "vehicleStatus.evStatus.reservChargeInfos.offpeakPowerInfo.offPeakPowerFlag",
+                )
+                == 1
+            ):
+                vehicle.ev_off_peak_charge_only_enabled = False
+
+        if (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reservFlag",
+            )
+            == 1
+        ):
+            vehicle.ev_schedule_charge_enabled = True
+        elif (
+            get_child_value(
+                state,
+                "vehicleStatus.evStatus.reservChargeInfos.reservFlag",
+            )
+            == 0
+        ):
+            vehicle.ev_schedule_charge_enabled = False
+
+        vehicle.washer_fluid_warning_is_on = get_child_value(
+            state, "vehicleStatus.washerFluidStatus"
+        )
+        vehicle.brake_fluid_warning_is_on = get_child_value(
+            state, "vehicleStatus.breakOilStatus"
+        )
+        vehicle.fuel_level = get_child_value(state, "vehicleStatus.fuelLevel")
+        vehicle.fuel_level_is_low = get_child_value(state, "vehicleStatus.lowFuelLight")
+        vehicle.air_control_is_on = get_child_value(state, "vehicleStatus.airCtrlOn")
+        vehicle.smart_key_battery_warning_is_on = get_child_value(
+            state, "vehicleStatus.smartKeyBatteryWarning"
+        )
+
+        if get_child_value(state, "vehicleLocation.coord.lat"):
+            vehicle.location = (
+                get_child_value(state, "vehicleLocation.coord.lat"),
+                get_child_value(state, "vehicleLocation.coord.lon"),
+                parse_datetime(
+                    get_child_value(state, "vehicleLocation.time"), self.data_timezone
+                ),
+            )
+        vehicle.data = state
+
+    def _get_cached_vehicle_state(
+        self, token: Token, vehicle: Vehicle
+    ) -> dict[str, Any]:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id
+        if vehicle.ccu_ccs2_protocol_support == 0:
+            url = url + "/status/latest"
+        else:
+            url = url + "/ccs2/carstatus/latest"
+        response = self.session.get(
+            url,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        ).json()
+        _LOGGER.debug(f"{DOMAIN} - get_cached_vehicle_status response: {response}")
+        _check_response_for_errors(response)
+        if vehicle.ccu_ccs2_protocol_support == 0:
+            response = response["resMsg"]["vehicleStatusInfo"]
+        else:
+            response = response["resMsg"]["state"]["Vehicle"]
+        return cast(dict[str, Any], response)
+
+    def _set_cached_location_park(self, token: Token, vehicle: Vehicle) -> None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/location/park"
+
+        try:
+            response = self.session.get(
+                url, headers=self._get_authenticated_headers(token)
+            ).json()
+            _LOGGER.debug(f"{DOMAIN} - _get_location response: {response}")
+            _check_response_for_errors(response)
+
+            location = response["resMsg"]
+            if location and get_child_value(location, "coord.lat"):
+                vehicle.location = (
+                    get_child_value(location, "coord.lat"),
+                    get_child_value(location, "coord.lon"),
+                    parse_datetime(
+                        get_child_value(location, "time"), self.data_timezone
+                    ),
+                )
+        except Exception:
+            _LOGGER.debug(f"{DOMAIN} - _get_location failed")
+            return
+
+    def _get_location(self, token: Token, vehicle: Vehicle) -> dict[str, Any] | None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/location"
+
+        try:
+            response = self.session.get(
+                url,
+                headers=self._get_authenticated_headers(
+                    token, vehicle.ccu_ccs2_protocol_support
+                ),
+            ).json()
+            _LOGGER.debug(f"{DOMAIN} - _get_location response: {response}")
+            _check_response_for_errors(response)
+            res_msg = response["resMsg"]
+            # Some accounts return the location fields flat under resMsg
+            # (GET /location/park already parses the same flat shape, #1301).
+            gps_detail = res_msg.get("gpsDetail") or res_msg
+            return cast(dict[str, Any] | None, gps_detail)
+        except Exception as e:
+            _LOGGER.exception(f"{DOMAIN} - _get_location failed: {type(e).__name__}")
+            return None
+
+    def _set_location_from_gps_detail(
+        self, vehicle: Vehicle, gps_detail: dict[str, Any] | None
+    ) -> None:
+        """Apply the gpsDetail of GET /location, whose time is UTC.
+
+        Two feeds fill vehicle.location from the same compact YYYYMMDDHHMMSS
+        shape but on different clocks: this one is UTC, while the
+        vehicleLocation embedded in the cached status response and
+        GET /location/park are region local. parse_datetime only labels a
+        compact value, so _update_vehicle_properties leaves this feed one UTC
+        offset early. Convert here, as the CCS2 'Date' field does (#1147).
+        """
+        if not gps_detail or not get_child_value(gps_detail, "coord.lat"):
+            _LOGGER.warning(
+                f"{DOMAIN} - no location data in location response, "
+                "vehicle may be offline or returning partial status"
+            )
+            return
+        # A missing timestamp must stay None, which HA shows as "unknown".
+        # See kia_uvo #1771.
+        location_last_updated_at = parse_datetime(
+            get_child_value(gps_detail, "time"), dt.UTC
+        )
+        if location_last_updated_at is not None:
+            location_last_updated_at = location_last_updated_at.astimezone(
+                self.data_timezone
+            )
+        vehicle.location = (
+            get_child_value(gps_detail, "coord.lat"),
+            get_child_value(gps_detail, "coord.lon"),
+            location_last_updated_at,
+        )
+
+    @_retry_on_device_id_error
+    def charge_port_action(
+        self, token: Token, vehicle: Vehicle, action: CHARGE_PORT_ACTION
+    ) -> str:
+        url = self.SPA_API_URL_V2 + "vehicles/" + vehicle.id + "/control/portdoor"
+
+        payload = {"action": action.value}
+        _LOGGER.debug(f"{DOMAIN} - Charge Port Action Request: {payload}")
+        response = self.session.post(
+            url, json=payload, headers=self._get_control_headers(token, vehicle)
+        ).json()
+
+        _LOGGER.debug(f"{DOMAIN} - Charge Port Action Response: {response}")
+        _check_response_for_errors(response)
+        return cast(str, response["msgId"])
+
+    def _get_cookies(self) -> dict[str, Any]:
+        # Get Cookies #
+        url = (
+            self.USER_API_URL
+            + "oauth2/authorize?response_type=code&state=test&client_id="
+            + self.CLIENT_ID
+            + "&redirect_uri="
+            + self.USER_API_URL
+            + "oauth2/redirect&lang="
+            + self.LANGUAGE
+        )
+
+        _LOGGER.debug(f"{DOMAIN} - Get cookies request: {url}")
+        with AuthSession() as session:
+            session.get(url)
+            return cast(dict[str, Any], session.cookies.get_dict())
+
+    def _set_session_language(self, cookies: dict[str, Any]) -> None:
+        auth_request(
+            "post", self.USER_API_URL + "language", session=self.session,
+            headers={"Content-type": "application/json"},
+            json={"lang": self.LANGUAGE}, cookies=cookies,
+        )
