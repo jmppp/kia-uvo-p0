@@ -22,5 +22,5 @@
     "Pillow==13.0.0",
     "numpy==2.3.2"
   ],
-  "version": "3.22.0+pgp0.7"
+  "version": "3.22.0+pgp0.9"
 }

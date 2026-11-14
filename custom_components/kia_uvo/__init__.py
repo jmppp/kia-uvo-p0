@@ -62,6 +62,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     await hass.async_add_executor_job(verify)
     coordinator = HyundaiKiaConnectDataUpdateCoordinator(hass, config_entry)
     try:
+        from .wake_budget import budget
+        await budget(coordinator).journal.load(hass)
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryAuthFailed as AuthError:
         raise ConfigEntryAuthFailed(AuthError) from AuthError

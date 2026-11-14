@@ -47,6 +47,7 @@ SERVICE_CAPTURE_SVM_IMAGE = "capture_svm_image"
 SUPPORTED_SERVICES = (
     SERVICE_UPDATE,
     SERVICE_FORCE_UPDATE,
+    "force_refresh_guarded",
     SERVICE_LOCK,
     SERVICE_UNLOCK,
     SERVICE_STOP_CLIMATE,
@@ -76,6 +77,18 @@ _LOGGER = logging.getLogger(__name__)
 @callback
 def async_setup_services(hass: HomeAssistant) -> bool:
     """Set up services for Hyundai / Kia Connect."""
+
+    async def async_handle_guarded_force(call: ServiceCall):
+        device = device_registry.async_get(hass).async_get(call.data.get('device_id'))
+        matches = [c for c in hass.data.get(DOMAIN, {}).values() if c.config_entry.entry_id == call.data.get('entry_id')]
+        if device is None or len(matches) != 1 or matches[0].config_entry.entry_id not in device.config_entries:
+            raise HomeAssistantError('Wrong Kia entry or device')
+        coordinator = matches[0]
+        vehicles = [vid for domain, vid in device.identifiers if domain == DOMAIN and vid in coordinator.vehicle_manager.vehicles]
+        if len(vehicles) != 1:
+            raise HomeAssistantError('Kia vehicle is not uniquely mapped')
+        vehicle_id = vehicles[0]
+        await coordinator.async_force_refresh_guarded(vehicle_id, call.data['send_guard'], call.data['departure'])
 
     async def async_handle_force_update(call: ServiceCall) -> None:
         coordinator = _get_coordinator_from_device(hass, call)
@@ -371,6 +384,7 @@ def async_setup_services(hass: HomeAssistant) -> bool:
 
     services = {
         SERVICE_FORCE_UPDATE: async_handle_force_update,
+        "force_refresh_guarded": async_handle_guarded_force,
         SERVICE_UPDATE: async_handle_update,
         SERVICE_START_CLIMATE: async_handle_start_climate,
         SERVICE_START_CLIMATE_GUARDED: async_handle_start_climate,

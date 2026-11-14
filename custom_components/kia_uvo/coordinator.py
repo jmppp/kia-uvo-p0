@@ -273,7 +273,14 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
                 self._log_vehicle_failure(vehicle_id, err)
                 if auth_failures == len(self.vehicle_manager.vehicles):
                     raise ConfigEntryAuthFailed(err) from err
+                if mode != "cached":
+                    # One vehicle's wake rejection is not account evidence.
+                    # Do not wake other cars to diagnose credentials: the next
+                    # ordinary cache cycle applies the existing all-vehicles rule.
+                    break
             except RateLimitingError as err:
+                from .wake_budget import budget
+                await budget(self).defer(7200)
                 raise UpdateFailed(
                     f"Rate limited by the API: {err}", retry_after=2 * 60 * 60
                 ) from err
@@ -290,34 +297,17 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
 
     async def _async_poll_vehicle(self, vehicle_id: str, *, mode: PollMode) -> None:
         """Update one vehicle, falling back to the cached state if a force fails."""
-        try:
-            if mode == "check":
-                await self.hass.async_add_executor_job(
-                    self.vehicle_manager.check_and_force_update_vehicle,
-                    self.force_refresh_interval,
-                    vehicle_id,
-                )
-            elif mode == "force":
-                await self.hass.async_add_executor_job(
-                    self.vehicle_manager.force_refresh_vehicle_state, vehicle_id
-                )
-            else:
-                await self.hass.async_add_executor_job(
-                    self.vehicle_manager.update_vehicle_with_cached_state, vehicle_id
-                )
-        except Exception as err:
-            if mode == "cached":
-                raise
-            _LOGGER.warning(
-                "%s - Force refresh failed for %s (%s), using cached state: %s",
-                DOMAIN,
-                self.vehicle_manager.vehicles[vehicle_id].name,
-                vehicle_id,
-                err,
-            )
-            await self.hass.async_add_executor_job(
-                self.vehicle_manager.update_vehicle_with_cached_state, vehicle_id
-            )
+        vehicle = self.vehicle_manager.vehicles[vehicle_id]
+        if mode == "check":
+            from datetime import datetime, timezone
+            stamp = vehicle.last_updated_at
+            if stamp is not None and (datetime.now(timezone.utc)-stamp).total_seconds() > self.force_refresh_interval:
+                await self.async_force_refresh_vehicle(vehicle_id, source='poll')
+                return
+        elif mode == "force":
+            await self.async_force_refresh_vehicle(vehicle_id)
+            return
+        await self.hass.async_add_executor_job(self.vehicle_manager.update_vehicle_with_cached_state, vehicle_id)
 
     def _log_vehicle_failure(self, vehicle_id: str, err: Exception) -> None:
         vehicle = self.vehicle_manager.vehicles[vehicle_id]
@@ -348,15 +338,16 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
         """Return False if the vehicle's last poll failed."""
         return vehicle_id not in self._failed_vehicles
 
-    async def async_force_refresh_vehicle(self, vehicle_id: str) -> None:
+    async def async_force_refresh_vehicle(self, vehicle_id: str, *, source='native') -> None:
         """Force refresh a single vehicle's state."""
-        await self.async_check_and_refresh_token()
-        if self._auth_recovery_pending:
-            raise HomeAssistantError("Cache recovery is required before force refresh")
-        await self.hass.async_add_executor_job(
-            self.vehicle_manager.force_refresh_vehicle_state, vehicle_id
-        )
-        self.async_set_updated_data(self.data)
+        from .wake_budget import budget
+        return await budget(self).run(self, vehicle_id, source=source)
+
+    async def async_force_refresh_guarded(self, vehicle_id, spec, departure):
+        if not isinstance(spec, dict) or type(departure) not in (int, float):
+            raise HomeAssistantError('Explicit wake guard and departure are required')
+        from .wake_budget import budget
+        return await budget(self).run(self, vehicle_id, spec, departure)
 
     async def async_supports_svm(self, vehicle_id: str) -> bool:
         """Return whether the given vehicle supports SVM.
@@ -731,9 +722,7 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
             )
         finally:
             try:
-                await self.hass.async_add_executor_job(
-                    self.vehicle_manager.force_refresh_vehicle_state, vehicle_id
-                )
+                await self.async_force_refresh_vehicle(vehicle_id)
             except Exception:
                 _LOGGER.exception("Force refresh after call failed")
             self.async_set_updated_data(self.data)

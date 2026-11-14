@@ -22,3 +22,7 @@ No additional license restrictions or invented copyright assignments are added.
 Fork owner and codeowner: @jmppp. Public source and support:
 https://github.com/jmppp/kia-uvo-p0 and its Issues page.
 This is an independently maintained, modified fork, not an upstream release.
+
+Additional pgp0.9 changes: guarded one-shot EU legacy status wake, shared durable
+reservation/cooldown, crash reconciliation, and vehicle-scoped wake errors.
+No location or driving fetch is added to status wake.

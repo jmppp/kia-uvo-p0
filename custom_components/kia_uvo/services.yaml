@@ -549,3 +549,27 @@ reconnect:
       selector:
         config_entry:
           integration: kia_uvo
+
+force_refresh_guarded:
+  name: Guarded status wake
+  description: One durable, entry-scoped EU legacy status wake.
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: kia_uvo
+    entry_id:
+      required: true
+      selector:
+        text:
+    departure:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 9999999999
+    send_guard:
+      required: true
+      selector:
+        object:

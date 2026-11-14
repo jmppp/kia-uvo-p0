@@ -1241,3 +1241,39 @@ class KiaUvoApiEU(CciAuthMixin, ApiImplType1):
             headers={"Content-type": "application/json"},
             json={"lang": self.LANGUAGE}, cookies=cookies,
         )
+
+    def force_status_once(self, token, vehicle):
+        """One EU legacy status GET; no DeviceID retry, location or driving info."""
+        from .exceptions import RateLimitingError, APIError
+        from email.utils import parsedate_to_datetime
+        from time import time
+        from math import isfinite
+        if vehicle.ccu_ccs2_protocol_support != 0:
+            raise APIError('Unsupported status wake protocol')
+        response = self.session.get(
+            self.SPA_API_URL + 'vehicles/' + vehicle.id + '/status',
+            headers=self._get_vehicle_headers(token, vehicle), allow_redirects=False,
+        )
+        try:
+            if response.status_code == 429 or response.status_code in (500, 502, 503):
+                value = response.headers.get('Retry-After', '')
+                try: delay = max(0, float(value))
+                except ValueError:
+                    try: delay = max(0, parsedate_to_datetime(value).timestamp() - time())
+                    except (TypeError, ValueError, OverflowError): delay = 0
+                if not isfinite(delay):delay = 0
+                error = RateLimitingError('Status rate limited') if response.status_code == 429 else APIError('Status server failure')
+                error.retry_after = max(7200 if response.status_code == 429 else 0, delay)
+                raise error
+            if response.status_code != 200:
+                raise APIError('Status HTTP failure')
+            try: payload = response.json()
+            except (ValueError, TypeError): raise APIError('Invalid status response') from None
+            _check_response_for_errors(payload)
+            raw = payload.get('resMsg')
+            if not isinstance(raw, dict): raise APIError('Missing raw vehicle status')
+            # Apply on success; callers verify raw time, never last_scanned_at.
+            self._update_vehicle_properties(vehicle, {'vehicleStatus': raw})
+            return raw
+        finally:
+            response.close()

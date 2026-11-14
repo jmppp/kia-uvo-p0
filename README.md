@@ -10,13 +10,13 @@ Owner and codeowner: **@jmppp**.
 
 ## Qualified version
 
-- Fixed release reference: **v3.22.0-pgp0.7**.
-- Integration: **3.22.0+pgp0.7**.
-- Private SDK: **4.45.0+pgp0.7**; no global SDK replacement.
+- Fixed release reference: **v3.22.0-pgp0.9**.
+- Integration: **3.22.0+pgp0.9**.
+- Private SDK: **4.45.0+pgp0.9**; no global SDK replacement.
 - Qualified target: exactly **Home Assistant Core 2026.11.0 / Python 3.14**.
   Other versions fail closed until separately qualified.
-- Distribution identity: **pgp0.7-marketplace-proposal.3**. Python runtime code
-  is unchanged from the reviewed pgp0.7 integration.
+- Distribution identity: **pgp0.9-marketplace-proposal.1**. Python runtime code
+  is unchanged from the reviewed pgp0.9 integration.
 
 ## Changes from upstream
 
@@ -72,3 +72,18 @@ MIT. Original copyright and source notices are retained. See `LICENSE` and
 `UPSTREAM.md`, including the private SDK's retained MIT license. Upstream
 maintainers are not responsible for this fork. No real account or vehicle
 credentials are included.
+
+## Bounded vehicle status wake (EU legacy)
+
+Native Force Refresh and guarded status wake share a persistent account-entry
+reservation and at least 1800 seconds between attempts. Unknown outcomes consume
+the reservation; unfinished records on startup block automatic force polling.
+A later explicit request must pass the original budget. No automatic replay.
+
+This release supports status-only wake for EU legacy vehicles. It does **not**
+refresh GPS or driving data and does not claim CCS2 or other-region wake support.
+A manual caller requiring fresh GPS can still refuse climate start. The guarded
+force service requires an explicit compatible caller contract, not a schedule
+included in this repository. No heating duration or original climate payload
+is changed. Kia availability, 12 V battery impact and response times are not
+guaranteed by the local budget.
